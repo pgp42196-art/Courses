@@ -26,7 +26,10 @@
     attempts: [],
     custom: [],
     prefs: {},
-    settings: { sound: true, confetti: true, calm: false }
+    settings: { sound: true, confetti: true, calm: false },
+    aiKey: "",
+    outbox: [],
+    cloudSynced: false
   });
   let db = defaults();
   function load() {
@@ -40,9 +43,133 @@
   }
   function save() {
     if (!ls || !safe.set(ls, KEY, JSON.stringify(db))) {
-      toast("Couldn't save to this browser (storage is blocked or full).");
+      if (!cloud.on) toast("Couldn't save to this browser (storage is blocked or full).");
     }
   }
+
+  /* ---------------- cloud sync (Supabase) ---------------- */
+  // Local mode: passcode checked in the page, data in this browser.
+  // Cloud mode: the passcode is the password of one Supabase user, and every change syncs to the database.
+  const CFG = window.QM_CONFIG || {};
+  const PW_PREFIX = "quizmaxxing-"; // Supabase needs 6+ character passwords, so "open" becomes "quizmaxxing-open"
+  const cloud = {
+    on: !!(CFG.supabaseUrl && CFG.supabaseAnonKey && CFG.accountEmail && window.supabase),
+    sb: null, user: null, status: "idle", error: ""
+  };
+  if (cloud.on) {
+    cloud.sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, {
+      auth: { persistSession: true, autoRefreshToken: true, storageKey: "quizmaxxing.auth" }
+    });
+  }
+  const quizIdOf = (raw) => { try { return normalizeQuiz(raw).id; } catch { return String(raw && raw.id || ""); } };
+
+  function setStatus(s, err = "") {
+    cloud.status = s; cloud.error = err;
+    const el = $("#sync-pill");
+    if (el) { el.textContent = syncLabel(); el.dataset.state = s; el.title = err || ""; }
+  }
+  const syncLabel = () => !cloud.on ? "" : ({ ok: "☁️ synced", syncing: "☁️ syncing…", offline: "⚠️ offline", idle: "☁️" })[cloud.status] || "☁️";
+
+  // Every change goes through the outbox so nothing is lost if the network drops.
+  function queue(op) {
+    if (!cloud.on) { save(); return; }
+    db.outbox.push(op);
+    save();
+    flush();
+  }
+  let flushing = null;
+  function flush() {
+    if (!cloud.on || !cloud.user) return Promise.resolve();
+    if (flushing) return flushing;
+    flushing = (async () => {
+      await null; // make sure `flushing` is assigned before the finally block clears it
+      setStatus("syncing");
+      try {
+        while (db.outbox.length) {
+          await runOp(db.outbox[0]);
+          db.outbox.shift();
+          save();
+        }
+        setStatus("ok");
+      } catch (e) {
+        console.warn("sync failed", e);
+        setStatus("offline", e.message || String(e));
+      } finally { flushing = null; }
+    })();
+    return flushing;
+  }
+  async function runOp(op) {
+    const sb = cloud.sb, owner = cloud.user.id;
+    const chk = ({ error }) => { if (error) throw new Error(error.message); };
+    switch (op.t) {
+      case "attempt": return chk(await sb.from("attempts").upsert({ owner, id: op.data.id, data: op.data }, { onConflict: "owner,id" }));
+      case "delattempt": return chk(await sb.from("attempts").delete().eq("owner", owner).eq("id", op.id));
+      case "wipe": return chk(await sb.from("attempts").delete().eq("owner", owner));
+      case "quiz": return chk(await sb.from("quizzes").upsert({ owner, id: op.id, data: op.data, updated_at: new Date().toISOString() }, { onConflict: "owner,id" }));
+      case "delquiz": return chk(await sb.from("quizzes").delete().eq("owner", owner).eq("id", op.id));
+      case "state": return chk(await sb.from("user_state").upsert({ owner, prefs: db.prefs, settings: db.settings, ai_key: db.aiKey || null, updated_at: new Date().toISOString() }, { onConflict: "owner" }));
+      default: return undefined;
+    }
+  }
+
+  // Pull everything from the database. Local-only data from before sync was set up gets uploaded once.
+  async function pull() {
+    if (!cloud.on || !cloud.user) return;
+    await flush();
+    if (db.outbox.length) return; // still offline, keep local copy
+    setStatus("syncing");
+    try {
+      const sb = cloud.sb;
+      const [q, a, s] = await Promise.all([
+        sb.from("quizzes").select("id,data").order("updated_at", { ascending: true }),
+        sb.from("attempts").select("id,data").order("created_at", { ascending: false }).limit(2000),
+        sb.from("user_state").select("prefs,settings,ai_key").maybeSingle()
+      ]);
+      for (const r of [q, a, s]) if (r.error) throw new Error(r.error.message);
+      const cloudAttempts = a.data.map((r) => r.data);
+      const cloudCustom = q.data.map((r) => r.data);
+      if (!db.cloudSynced) {
+        const haveA = new Set(cloudAttempts.map((x) => x.id));
+        const haveQ = new Set(cloudCustom.map(quizIdOf));
+        db.attempts.filter((x) => !haveA.has(x.id)).forEach((x) => { cloudAttempts.push(x); db.outbox.push({ t: "attempt", data: x }); });
+        db.custom.filter((x) => !haveQ.has(quizIdOf(x))).forEach((x) => { cloudCustom.push(x); db.outbox.push({ t: "quiz", id: quizIdOf(x), data: x }); });
+        if (!s.data) db.outbox.push({ t: "state" });
+        db.cloudSynced = true;
+      }
+      db.attempts = cloudAttempts.sort((x, y) => new Date(y.date) - new Date(x.date));
+      db.custom = cloudCustom;
+      if (s.data) {
+        db.prefs = s.data.prefs || {};
+        db.settings = Object.assign(defaults().settings, s.data.settings || {});
+        db.aiKey = s.data.ai_key || "";
+      }
+      save();
+      applyCalm();
+      setStatus("ok");
+      if (db.outbox.length) flush();
+    } catch (e) {
+      console.warn("pull failed", e);
+      setStatus("offline", e.message || String(e));
+    }
+  }
+
+  // Data changes used by the rest of the app.
+  const data = {
+    addAttempt(a) { db.attempts.unshift(a); queue({ t: "attempt", data: a }); },
+    deleteAttempt(id) { db.attempts = db.attempts.filter((a) => a.id !== id); queue({ t: "delattempt", id }); },
+    wipeAttempts() { db.attempts = []; db.prefs = {}; queue({ t: "wipe" }); queue({ t: "state" }); },
+    saveQuiz(raw) {
+      const id = quizIdOf(raw);
+      raw.id = id;
+      const i = db.custom.findIndex((c) => quizIdOf(c) === id);
+      if (i >= 0) db.custom[i] = raw; else db.custom.push(raw);
+      queue({ t: "quiz", id, data: raw });
+      return id;
+    },
+    deleteQuiz(id) { db.custom = db.custom.filter((c) => quizIdOf(c) !== id); queue({ t: "delquiz", id }); },
+    saveState() { queue({ t: "state" }); }
+  };
+  window.addEventListener("online", () => { flush().then(pull).then(() => { if (!session) route(); }); });
 
   /* ---------------- text helpers ---------------- */
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -305,7 +432,7 @@
   }
 
   /* ---------------- gate ---------------- */
-  const isUnlocked = () => (ss && safe.get(ss, UNLOCK_KEY) === "1") || (ls && safe.get(ls, UNLOCK_KEY) === "1");
+  const isUnlocked = () => (!cloud.on || !!cloud.user) && ((ss && safe.get(ss, UNLOCK_KEY) === "1") || (ls && safe.get(ls, UNLOCK_KEY) === "1"));
   function renderGate() {
     document.title = "Quizmaxxing";
     app.innerHTML = `
@@ -329,31 +456,57 @@
       </section>`;
     const form = $("#gate-form");
     $("#pass").focus();
-    form.addEventListener("submit", (e) => {
+    const fail = (msg) => {
+      sfx.wrong();
+      const card = $("#gate-card");
+      card.classList.remove("shake"); void card.offsetWidth; card.classList.add("shake");
+      $("#gate-err").textContent = msg;
+      $("#pass").select();
+    };
+    const unlock = () => {
+      ss && safe.set(ss, UNLOCK_KEY, "1");
+      if ($("#remember").checked && ls) safe.set(ls, UNLOCK_KEY, "1");
+      sfx.unlock(); confetti(90);
+    };
+    form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const val = $("#pass").value.trim().toLowerCase();
-      if (val === PASSCODE.toLowerCase()) {
-        ss && safe.set(ss, UNLOCK_KEY, "1");
-        if ($("#remember").checked && ls) safe.set(ls, UNLOCK_KEY, "1");
-        sfx.unlock(); confetti(90);
-        route();
-      } else {
-        sfx.wrong();
-        const card = $("#gate-card");
-        card.classList.remove("shake"); void card.offsetWidth; card.classList.add("shake");
-        $("#gate-err").textContent = val ? "Nope, wrong passcode. Try again." : "Type the passcode first.";
-        $("#pass").select();
+      if (!val) return fail("Type the passcode first.");
+      if (!cloud.on) {
+        if (val === PASSCODE.toLowerCase()) { unlock(); route(); } else fail("Nope, wrong passcode. Try again.");
+        return;
       }
+      const btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true; btn.textContent = "Checking…";
+      const { data: res, error } = await cloud.sb.auth.signInWithPassword({ email: CFG.accountEmail, password: PW_PREFIX + val });
+      btn.disabled = false; btn.textContent = "Let me in →";
+      if (error) {
+        const offline = /fetch|network/i.test(error.message);
+        return fail(offline ? "Can't reach the server. Check your internet and try again." : "Nope, wrong passcode. Try again.");
+      }
+      cloud.user = res.user;
+      unlock();
+      app.innerHTML = `<section class="gate"><div class="gate-card"><div class="lock">☁️</div><h2>Syncing your stuff…</h2></div></section>`;
+      await pull();
+      route();
     });
   }
-  function lockNow() {
+  async function lockNow() {
     ss && safe.del(ss, UNLOCK_KEY); ls && safe.del(ls, UNLOCK_KEY);
     stopTimer(); session = null;
+    if (cloud.on) {
+      await flush();
+      await cloud.sb.auth.signOut().catch(() => {});
+      cloud.user = null;
+      // Keep nothing personal on a locked device.
+      const keep = db.settings, pending = db.outbox;
+      db = defaults(); db.settings = keep; db.outbox = pending; db.cloudSynced = true; save();
+    }
     renderGate();
   }
 
   /* ---------------- shell ---------------- */
-  const TABS = [["quizzes", "Quizzes"], ["dashboard", "Dashboard"], ["add", "Add quiz"], ["settings", "Settings"]];
+  const TABS = [["quizzes", "Quizzes"], ["dashboard", "Dashboard"], ["ai", "✨ AI maker"], ["add", "Add quiz"], ["settings", "Settings"]];
   function shell(active, inner) {
     const xp = totalXp(), L = levelInfo(xp);
     return `
@@ -362,6 +515,7 @@
         <nav class="tabs" aria-label="Main">
           ${TABS.map(([id, label]) => `<a class="tab" href="#${id}" ${id === active ? 'aria-current="page"' : ""}>${label}</a>`).join("")}
         </nav>
+        ${cloud.on ? `<span class="sync-pill" id="sync-pill" data-state="${cloud.status}" title="${esc(cloud.error)}">${syncLabel()}</span>` : ""}
         <div class="lvl" title="${xp} XP total">
           <span class="lvl-badge">LV ${L.lvl}</span>
           <span class="lvl-bar" aria-hidden="true"><i style="width:${pct(L.into, L.need)}%"></i></span>
@@ -380,7 +534,7 @@
     if (session) return renderPlayer();
     closeModal();
     const tab = currentTab();
-    ({ quizzes: renderLibrary, dashboard: renderDashboard, add: renderAdd, settings: renderSettings })[tab]();
+    ({ quizzes: renderLibrary, dashboard: renderDashboard, ai: renderAI, add: renderAdd, settings: renderSettings })[tab]();
     document.title = `Quizmaxxing · ${TABS.find(([id]) => id === tab)[1]}`;
     window.scrollTo(0, 0);
   }
@@ -536,7 +690,7 @@
           timer: m.querySelector("#opt-timer") ? m.querySelector("#opt-timer").checked : false,
           count: cnt ? Number(cnt.value) : n
         };
-        db.prefs[quiz.id] = opts; save();
+        db.prefs[quiz.id] = opts; data.saveState();
         closeModal();
         startQuiz(quiz, opts);
       };
@@ -791,8 +945,7 @@
       bestStreak: Math.max(best, s.bestStreak), xp, hints: s.hintsShown.size, items,
       opts: s.opts
     };
-    db.attempts.unshift(attempt);
-    save();
+    data.addAttempt(attempt);
     const newly = [...unlockedIds()].filter((id) => !before.has(id));
     const lvlAfter = levelInfo(totalXp()).lvl;
     const retryQuiz = s.quiz;
@@ -1057,7 +1210,8 @@
   let draft = null;
   function parseDraft(text) {
     let data;
-    try { data = JSON.parse(text); }
+    const cleaned = String(text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    try { data = JSON.parse(cleaned); }
     catch (e) { throw new Error(`That isn't valid JSON yet: ${e.message}. Check for missing commas or quotes.`); }
     const list = Array.isArray(data) ? data : [data];
     if (!list.length) throw new Error("The list is empty.");
@@ -1067,7 +1221,7 @@
     const text = draft ?? TEMPLATE;
     app.innerHTML = shell("add", `
       <div class="view-head"><div><span class="sticker">feed the machine</span><h1>Add a quiz</h1>
-        <p class="muted">Paste quiz JSON (one quiz or a list), or upload a .json file. It's saved in this browser.</p></div></div>
+        <p class="muted">Paste quiz JSON (one quiz or a list), or upload a .json file. ${cloud.on ? "It syncs to all your devices." : "It's saved in this browser."} Want it done for you? Try the <a href=\"#ai\">AI maker</a>.</p></div></div>
       <div class="two-col">
         <section class="panel">
           <div class="panel-head"><h2>Quiz JSON</h2>
@@ -1092,11 +1246,11 @@
           </ul>
           <p>Optional on every question: <code>explanation</code>, <code>hint</code>. Optional on the quiz: <code>emoji</code>, <code>description</code>, <code>tags</code>, <code>difficulty</code> (easy/medium/hard), <code>timeLimit</code> in seconds.</p>
           <p>Wrap text in backticks for <code>\`code\`</code> and double asterisks for <b>**bold**</b>.</p>
-          <p class="muted">Quizzes added to <code>quizzes.js</code> in the repo show up for everyone who opens the site. Quizzes saved here live in this browser only.</p>
+          <p class="muted">Quizzes added to <code>quizzes.js</code> in the repo show up for everyone who opens the site. Quizzes saved here ${cloud.on ? "sync to your account" : "live in this browser only"}.</p>
         </section>
       </div>
       <section class="panel">
-        <div class="panel-head"><h2>Your added quizzes</h2><span class="label">${db.custom.length} saved here</span></div>
+        <div class="panel-head"><h2>Your added quizzes</h2><span class="label">${db.custom.length} saved</span></div>
         ${db.custom.length ? `<div class="custom-list">${db.custom.map((c, i) => `
           <div class="custom-item"><span>${esc(c.emoji || "📝")} ${esc(c.title)}</span>
             <span class="label" style="flex:none">${(c.questions || []).length} q</span>
@@ -1132,16 +1286,348 @@
     const list = validateDraft();
     if (!list) return;
     const builtIds = new Set(builtIn.map((q) => q.id));
-    for (const { raw, quiz } of list) {
-      if (builtIds.has(quiz.id)) { $("#add-err").textContent = `"${quiz.title}" has the same id as a quiz in quizzes.js. Give it a different "id" or title.`; return; }
-      const i = db.custom.findIndex((c) => normalizeQuiz(c).id === quiz.id);
-      if (i >= 0) db.custom[i] = raw; else db.custom.push(raw);
-    }
-    save();
+    const clash = list.find(({ quiz }) => builtIds.has(quiz.id));
+    if (clash) { $("#add-err").textContent = `"${clash.quiz.title}" has the same id as a quiz in quizzes.js. Give it a different "id" or title.`; return; }
+    list.forEach(({ raw }) => data.saveQuiz(raw));
     draft = null;
     sfx.right(); confetti(80);
     toast(list.length > 1 ? `Saved ${list.length} quizzes 🎉` : `Saved "${list[0].quiz.title}" 🎉`);
     location.hash = "#quizzes";
+  }
+
+  /* ---------------- AI quiz maker ---------------- */
+  const AI_MODEL = "claude-opus-5-5";
+  const AI_SYSTEM = `You turn study material into a mock quiz for a quiz app. The user gives you raw material in any format: questions with an answer key, messy notes, a textbook excerpt, a PDF, a screenshot, or only a topic.
+
+Work out what the material is:
+- If it already contains questions, convert every one of them. Keep the wording and order, fix only obvious typos, and use the answer key when one is given. Don't add or drop questions.
+- If it's study material without questions, write the requested number of questions that test its most important ideas.
+- If it's only a topic, write the requested number of questions on that topic.
+Follow the user's mode setting when it isn't "auto".
+
+Question types:
+- single: exactly one correct option.
+- multi: two or more correct options (the app already tells the player to select all that apply).
+- tf: a statement that is true or false.
+- text: a short typed answer such as a word, name, number or short phrase.
+
+Field rules:
+- single and multi: 3 to 5 options with plausible distractors of similar length, and no "all of the above" or "none of the above". "correct" holds the 0-based indices of the right options. For tf and text, options and correct are empty lists.
+- tf: tf_answer holds whether the statement is true. For other types set tf_answer to false.
+- text: "accepted" lists every reasonable form of the answer (for example "6" and "six"). For other types it is an empty list.
+- explanation: one or two sentences on why the answer is right.
+- hint: a nudge that doesn't give the answer away, or an empty string.
+- answer_source: "given" when the answer came from the user's material, "inferred" when you worked it out yourself. When unsure, still give your best answer and mark it inferred.
+- Formatting: wrap code in backticks and bold in double asterisks. No other markdown.
+- title: short and specific. emoji: one emoji. description: one line. tags: 1 to 3 lowercase tags. difficulty: the overall level.
+- notes: anything the user should double-check, such as questions you couldn't read, answers you had to infer, or ambiguous items. Use an empty string when there's nothing.`;
+
+  const AI_SCHEMA = {
+    type: "object",
+    additionalProperties: false,
+    required: ["title", "emoji", "description", "tags", "difficulty", "notes", "questions"],
+    properties: {
+      title: { type: "string" },
+      emoji: { type: "string" },
+      description: { type: "string" },
+      tags: { type: "array", items: { type: "string" } },
+      difficulty: { type: "string", enum: ["easy", "medium", "hard"] },
+      notes: { type: "string" },
+      questions: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["type", "q", "options", "correct", "tf_answer", "accepted", "explanation", "hint", "answer_source"],
+          properties: {
+            type: { type: "string", enum: ["single", "multi", "tf", "text"] },
+            q: { type: "string" },
+            options: { type: "array", items: { type: "string" } },
+            correct: { type: "array", items: { type: "integer" } },
+            tf_answer: { type: "boolean" },
+            accepted: { type: "array", items: { type: "string" } },
+            explanation: { type: "string" },
+            hint: { type: "string" },
+            answer_source: { type: "string", enum: ["given", "inferred"] }
+          }
+        }
+      }
+    }
+  };
+
+  const ai = { text: "", files: [], mode: "auto", count: 10, difficulty: "mixed", title: "", extra: "", busy: false, progress: "", result: null, notes: "", error: "", dropped: 0 };
+  const AI_MODES = { auto: "Figure it out", convert: "Convert my questions", generate: "Write new questions" };
+  const AI_ACCEPT = ".txt,.md,.csv,.json,.pdf,.png,.jpg,.jpeg,.webp,.gif";
+  const maskKey = (k) => (k.length > 12 ? `${k.slice(0, 7)}…${k.slice(-4)}` : "saved");
+
+  function readFile(f) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      const isText = /^text\/|json|csv/.test(f.type) || /\.(txt|md|csv|json)$/i.test(f.name);
+      r.onerror = () => reject(new Error(`Couldn't read ${f.name}.`));
+      r.onload = () => {
+        if (isText) return resolve({ name: f.name, kind: "text", text: String(r.result) });
+        const b64 = String(r.result).split(",")[1] || "";
+        if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) return resolve({ name: f.name, kind: "pdf", data: b64, media: "application/pdf" });
+        if (/^image\/(png|jpeg|webp|gif)$/.test(f.type)) return resolve({ name: f.name, kind: "image", data: b64, media: f.type });
+        reject(new Error(`${f.name} isn't a supported file. Use text, PDF or an image.`));
+      };
+      isText ? r.readAsText(f) : r.readAsDataURL(f);
+    });
+  }
+
+  function aiUserContent() {
+    const content = [];
+    ai.files.forEach((f) => {
+      if (f.kind === "pdf") content.push({ type: "document", source: { type: "base64", media_type: f.media, data: f.data }, title: f.name });
+      if (f.kind === "image") content.push({ type: "image", source: { type: "base64", media_type: f.media, data: f.data } });
+    });
+    const textFiles = ai.files.filter((f) => f.kind === "text").map((f) => `--- ${f.name} ---\n${f.text}`).join("\n\n");
+    const material = [ai.text.trim(), textFiles].filter(Boolean).join("\n\n");
+    content.push({
+      type: "text",
+      text: [
+        `Mode: ${ai.mode}`,
+        `Number of questions if you write new ones: ${ai.count}`,
+        `Difficulty: ${ai.difficulty}`,
+        ai.title.trim() ? `Quiz title: ${ai.title.trim()}` : "",
+        ai.extra.trim() ? `Extra instructions from the user: ${ai.extra.trim()}` : "",
+        "",
+        `<material>\n${material || "(see the attached files)"}\n</material>`
+      ].filter((l) => l !== "").join("\n")
+    });
+    return content;
+  }
+
+  // Turn the model's structured output into the app's quiz format. Broken questions are dropped and counted.
+  function aiToRaw(out) {
+    let dropped = 0;
+    const questions = [];
+    (out.questions || []).forEach((q) => {
+      const base = { q: q.q, explanation: q.explanation || "", hint: q.hint || "", aiGuessed: q.answer_source === "inferred" };
+      const opts = (q.options || []).filter((o) => String(o).trim());
+      const idx = [...new Set((q.correct || []).filter((i) => Number.isInteger(i) && i >= 0 && i < opts.length))].sort((a, b) => a - b);
+      let item = null;
+      if (q.type === "tf") item = { ...base, answer: !!q.tf_answer };
+      else if (q.type === "text" && (q.accepted || []).some((a) => String(a).trim())) item = { ...base, answer: q.accepted.filter((a) => String(a).trim()) };
+      else if (q.type === "single" && opts.length >= 2 && idx.length >= 1) item = { ...base, options: opts, answer: idx[0] };
+      else if (q.type === "multi" && opts.length >= 2 && idx.length >= 1) item = { ...base, options: opts, answer: idx.length === 1 ? idx[0] : idx };
+      if (item && String(q.q || "").trim()) questions.push(item); else dropped++;
+    });
+    return {
+      raw: {
+        title: ai.title.trim() || out.title || "AI quiz",
+        emoji: out.emoji || "✨",
+        description: out.description || "",
+        tags: (out.tags || []).slice(0, 3),
+        difficulty: out.difficulty,
+        questions
+      },
+      dropped
+    };
+  }
+
+  let anthropicSdk = null;
+  async function aiGenerate() {
+    if (ai.busy) return;
+    if (!db.aiKey) return toast("Add your Claude API key first.");
+    if (!ai.text.trim() && !ai.files.length) return toast("Paste some material or attach a file first.");
+    ai.busy = true; ai.error = ""; ai.result = null; ai.progress = "Reading your material…";
+    renderAI();
+    try {
+      if (!anthropicSdk) anthropicSdk = (await import(new URL("vendor/anthropic-sdk-0.131.0.js", document.baseURI).href)).default;
+      const Anthropic = anthropicSdk;
+      const client = new Anthropic({ apiKey: db.aiKey, dangerouslyAllowBrowser: true });
+      const request = (withFallback) => {
+        const params = {
+          model: AI_MODEL,
+          max_tokens: 64000,
+          thinking: { type: "adaptive" },
+          output_config: { effort: "medium", format: { type: "json_schema", schema: AI_SCHEMA } },
+          system: AI_SYSTEM,
+          messages: [{ role: "user", content: aiUserContent() }]
+        };
+        if (withFallback) { params.betas = ["server-side-fallback-2026-07-01"]; params.fallbacks = "default"; }
+        const stream = client.beta.messages.stream(params);
+        stream.on("text", (_delta, snapshot) => {
+          const n = (snapshot.match(/"q"\s*:/g) || []).length;
+          const el = $("#ai-progress");
+          ai.progress = n ? `Writing question ${n}…` : "Thinking it through…";
+          if (el) el.textContent = ai.progress;
+        });
+        return stream.finalMessage();
+      };
+      let msg;
+      try { msg = await request(true); }
+      catch (e) {
+        // If this account can't use server-side fallbacks, run the same request without them.
+        if (e instanceof Anthropic.BadRequestError && /fallback/i.test(e.message)) msg = await request(false);
+        else throw e;
+      }
+      if (msg.stop_reason === "refusal") throw new Error("Claude declined to make a quiz from this material. Try rewording it or removing anything sensitive.");
+      if (msg.stop_reason === "max_tokens") throw new Error("That's too much for one quiz. Split the material into smaller parts and run each one.");
+      const textBlock = msg.content.find((b) => b.type === "text");
+      if (!textBlock) throw new Error("Claude didn't return a quiz. Try again.");
+      const out = JSON.parse(textBlock.text);
+      const { raw, dropped } = aiToRaw(out);
+      if (!raw.questions.length) throw new Error("Claude couldn't find any usable questions in that. Add more detail and try again.");
+      normalizeQuiz(raw);
+      ai.result = raw; ai.notes = out.notes || ""; ai.dropped = dropped;
+      sfx.done(); confetti(70);
+    } catch (e) {
+      console.warn(e);
+      ai.error = aiErrorText(e);
+      sfx.wrong();
+    } finally {
+      ai.busy = false;
+      if (currentTab() === "ai" && !session) renderAI();
+    }
+  }
+  function aiErrorText(e) {
+    const A = anthropicSdk;
+    if (A) {
+      if (e instanceof A.AuthenticationError) return "Your API key was rejected. Check it in the key box below, or make a new one at platform.claude.com.";
+      if (e instanceof A.PermissionDeniedError) return "This API key isn't allowed to use Claude. Check your account at platform.claude.com.";
+      if (e instanceof A.RateLimitError) return "Too many requests right now. Wait a minute and try again.";
+      if (e instanceof A.BadRequestError && /credit|billing|balance/i.test(e.message)) return "Your Claude API account is out of credit. Add credit at platform.claude.com → Billing.";
+      if (e instanceof A.APIConnectionError) return "Couldn't reach Claude. Check your internet and try again.";
+      if (e instanceof A.APIError) return `Claude API error: ${e.message}`;
+    }
+    if (e instanceof SyntaxError) return "Claude's answer came back garbled. Try again.";
+    return e.message || String(e);
+  }
+
+  // For people without an API key: a prompt to paste into claude.ai whose answer goes straight into Add quiz.
+  function copyPrompt() {
+    const material = [ai.text.trim(), ...ai.files.filter((f) => f.kind === "text").map((f) => f.text)].filter(Boolean).join("\n\n");
+    const prompt = `Turn the material below into a quiz. Reply with only JSON in exactly this format, nothing else:
+
+{"title": "...", "emoji": "one emoji", "description": "one line", "tags": ["tag"], "difficulty": "easy|medium|hard",
+ "questions": [
+  {"q": "single choice question", "options": ["A", "B", "C", "D"], "answer": 1, "explanation": "why"},
+  {"q": "multi select question", "options": ["A", "B", "C"], "answer": [0, 2], "explanation": "why"},
+  {"q": "true/false statement", "answer": true, "explanation": "why"},
+  {"q": "short typed answer question", "answer": ["accepted answer", "another spelling"], "explanation": "why"}
+ ]}
+
+"answer" uses 0-based option positions. If the material already has questions, convert all of them and keep the answer key. Otherwise write ${ai.count} good questions (${ai.difficulty} difficulty) mixing the four types.${ai.extra.trim() ? `\nAlso: ${ai.extra.trim()}` : ""}
+
+MATERIAL:
+${material || "(attach your file here)"}`;
+    const done = () => toast("Prompt copied. Paste it into Claude, then paste the reply into Add quiz.", 4200);
+    const box = $("#ai-prompt-out");
+    if (box) { box.value = prompt; box.hidden = false; }
+    navigator.clipboard?.writeText(prompt).then(done, () => { box && box.select(); toast("Copy the prompt from the box below."); });
+  }
+
+  function renderAI() {
+    const hasKey = !!db.aiKey;
+    const r = ai.result;
+    const where = cloud.on ? "Saved to your account, so it works on all your devices." : "Saved in this browser only.";
+    const qHtml = r ? r.questions.map((q, i) => {
+      let nq; try { nq = normalizeQuestion(q, `Q${i + 1}`); } catch { nq = null; }
+      const typeLabel = nq ? { single: "single", multi: "multi", tf: "true/false", text: "type-in" }[nq.type] : "?";
+      const answerHtml = !nq ? "" : nq.type === "text"
+        ? `<div class="ai-opt right">✓ ${esc(nq.answer.join(" / "))}</div>`
+        : nq.options.map((o, oi) => `<div class="ai-opt ${nq.answer.includes(oi) ? "right" : ""}">${nq.answer.includes(oi) ? "✓" : "·"} ${fmt(o)}</div>`).join("");
+      return `<div class="rv ${q.aiGuessed ? "skipped" : ""}">
+        <div class="filter-row"><span class="label">Q${i + 1} · ${typeLabel}${q.aiGuessed ? ' · <span class="hl-lime">AI worked out this answer, check it</span>' : ""}</span>
+          <button class="icon-btn" data-act="aidelq" data-i="${i}" aria-label="Remove question ${i + 1}" title="Remove">🗑</button></div>
+        <div class="rv-q">${fmt(q.q)}</div>
+        <div class="ai-opts">${answerHtml}</div>
+        ${q.explanation ? `<div class="ex">💬 ${fmt(q.explanation)}</div>` : ""}
+      </div>`;
+    }).join("") : "";
+
+    app.innerHTML = shell("ai", `
+      <div class="view-head"><div><span class="sticker">✨ ai quiz maker</span><h1>Dump it, <span class="hl-pink">get a quiz.</span></h1>
+        <p class="muted">Paste questions, notes, a chapter or just a topic. Attach PDFs or screenshots. Claude turns it into a quiz you can check and publish.</p></div></div>
+
+      ${hasKey ? "" : `<section class="panel ai-key">
+        <h2>🔑 Connect Claude</h2>
+        <p>The AI maker uses your own Claude API key. Get one at <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">platform.claude.com</a> (add a little credit under Billing). A quiz usually costs a few cents. ${where}</p>
+        <div class="toolbar"><input class="field" id="ai-key" type="password" placeholder="sk-ant-…" autocomplete="off" aria-label="Claude API key"><button class="btn lime" data-act="aisavekey">Save key</button></div>
+        <p class="muted" style="font-size:.9rem">No key? Use <b>Copy prompt for Claude.ai</b> below instead. It's free with a normal Claude account.</p>
+      </section>`}
+
+      <div class="two-col">
+        <section class="panel">
+          <h2>Your material</h2>
+          <textarea class="field ai-text" id="ai-text" placeholder="Paste anything here…&#10;&#10;1. What is the capital of France? a) Paris b) Rome  Ans: a&#10;2. …&#10;&#10;or a page of notes, or just: 'Photosynthesis, class 9 level'" aria-label="Quiz material">${esc(ai.text)}</textarea>
+          <div class="row-actions">
+            <label class="btn ghost sm file-label">📎 Attach files<input type="file" id="ai-files" multiple accept="${AI_ACCEPT}"></label>
+            <span class="muted" style="font-size:.85rem">Text, PDF, PNG or JPG</span>
+          </div>
+          ${ai.files.length ? `<div class="chips">${ai.files.map((f, i) => `<span class="chip">${f.kind === "pdf" ? "📄" : f.kind === "image" ? "🖼️" : "📝"} ${esc(f.name)} <button class="icon-btn" style="padding:0 .2em;font-size:.9rem" data-act="aidelfile" data-i="${i}" aria-label="Remove ${esc(f.name)}">✕</button></span>`).join("")}</div>` : ""}
+        </section>
+        <section class="panel">
+          <h2>Options</h2>
+          <div class="opt-group"><label class="label" for="ai-mode">What should Claude do?</label>
+            <select class="field" id="ai-mode">${Object.entries(AI_MODES).map(([k, l]) => `<option value="${k}" ${ai.mode === k ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+          <div class="opt-group"><label class="label" for="ai-count">Questions to write (if it writes new ones)</label>
+            <div class="range-row"><input type="range" id="ai-count" min="3" max="40" value="${ai.count}"><span class="mono" id="ai-count-out" style="min-width:2.5em;text-align:right">${ai.count}</span></div></div>
+          <div class="opt-group"><label class="label" for="ai-diff">Difficulty</label>
+            <select class="field" id="ai-diff">${["mixed", "easy", "medium", "hard"].map((d) => `<option ${ai.difficulty === d ? "selected" : ""}>${d}</option>`).join("")}</select></div>
+          <div class="opt-group"><label class="label" for="ai-title">Title (optional)</label>
+            <input class="field" id="ai-title" value="${esc(ai.title)}" placeholder="e.g. Bio Chapter 3"></div>
+          <div class="opt-group"><label class="label" for="ai-extra">Extra instructions (optional)</label>
+            <input class="field" id="ai-extra" value="${esc(ai.extra)}" placeholder="e.g. only MCQs, focus on dates"></div>
+        </section>
+      </div>
+
+      <div class="row-actions">
+        <button class="btn pink big" data-act="aigo" ${ai.busy || !hasKey ? "disabled" : ""}>${ai.busy ? "⏳ Working…" : "✨ Make my quiz"}</button>
+        <button class="btn ghost" data-act="aicopy">📋 Copy prompt for Claude.ai</button>
+        ${ai.busy ? `<span class="pill hot" id="ai-progress">${esc(ai.progress)}</span>` : ""}
+      </div>
+      <textarea class="field" id="ai-prompt-out" hidden readonly aria-label="Prompt to copy" style="min-height:140px"></textarea>
+      ${ai.error ? `<div class="hint" role="alert">⚠️ ${esc(ai.error)}</div>` : ""}
+
+      ${r ? `<section class="panel">
+        <div class="panel-head"><h2>${esc(r.emoji)} ${esc(r.title)}</h2><span class="label">${r.questions.length} questions · ${esc(r.difficulty || "mixed")}</span></div>
+        ${r.description ? `<p class="muted">${fmt(r.description)}</p>` : ""}
+        ${ai.notes || ai.dropped ? `<div class="hint">📝 ${ai.notes ? fmt(ai.notes) : ""}${ai.dropped ? ` ${ai.dropped} question${ai.dropped > 1 ? "s were" : " was"} left out because ${ai.dropped > 1 ? "they weren't" : "it wasn't"} usable.` : ""}</div>` : ""}
+        <div class="review">${qHtml}</div>
+        <div class="row-actions">
+          <button class="btn lime big" data-act="aipublish">🚀 Publish quiz</button>
+          <button class="btn cyan" data-act="aiplay">▶ Publish &amp; play</button>
+          <button class="btn ghost" data-act="aiedit">Edit as JSON</button>
+          <button class="btn ghost" data-act="aidiscard">Discard</button>
+        </div>
+      </section>` : ""}
+
+      ${hasKey ? `<section class="panel">
+        <div class="panel-head"><h2>🔑 Claude API key</h2><span class="label mono">${esc(maskKey(db.aiKey))}</span></div>
+        <p class="muted">${where} Model: ${AI_MODEL}.</p>
+        <div class="row-actions"><button class="btn ghost sm" data-act="aidelkey">Remove key</button></div>
+      </section>` : ""}`);
+
+    const bindVal = (id, key, num) => { const el = $(id); el && el.addEventListener("input", () => { ai[key] = num ? Number(el.value) : el.value; if (id === "#ai-count") $("#ai-count-out").textContent = el.value; }); };
+    bindVal("#ai-text", "text"); bindVal("#ai-count", "count", true); bindVal("#ai-title", "title"); bindVal("#ai-extra", "extra");
+    $("#ai-mode").onchange = (e) => { ai.mode = e.target.value; };
+    $("#ai-diff").onchange = (e) => { ai.difficulty = e.target.value; };
+    $("#ai-files").addEventListener("change", async (e) => {
+      const files = [...e.target.files];
+      const tooBig = files.find((f) => f.size > 20 * 1024 * 1024);
+      if (tooBig) return toast(`${tooBig.name} is over 20 MB. Try a smaller file.`);
+      try { ai.files.push(...await Promise.all(files.map(readFile))); } catch (err) { toast(err.message); }
+      renderAI();
+    });
+  }
+
+  function aiPublish(play) {
+    const raw = ai.result;
+    if (!raw || !raw.questions.length) return;
+    const builtIds = new Set(builtIn.map((q) => q.id));
+    let id = quizIdOf(raw);
+    if (builtIds.has(id) || db.custom.some((c) => quizIdOf(c) === id)) { raw.id = `${id}-${uid().slice(-4)}`; id = raw.id; }
+    data.saveQuiz(raw);
+    ai.result = null; ai.text = ""; ai.files = []; ai.title = ""; ai.extra = ""; ai.notes = "";
+    sfx.right(); confetti(100);
+    toast(`Published "${raw.title}" 🚀`);
+    const quiz = findQuiz(quizIdOf(raw));
+    location.hash = "#quizzes";
+    if (play && quiz) setTimeout(() => openSetup(quiz), 60);
   }
 
   /* ---------------- settings ---------------- */
@@ -1159,7 +1645,9 @@
       </section>
       <section class="panel">
         <h2>Your data</h2>
-        <p class="muted">Scores and added quizzes are stored in this browser. Export a backup to move them to another device.</p>
+        ${cloud.on
+          ? `<p>☁️ <b>Online sync is on.</b> Scores, quizzes and settings save to your database and show up on every device where you enter the passcode. <span class="muted">Status: <span class="mono">${esc(syncLabel())}</span>${db.outbox.length ? ` · ${db.outbox.length} change${db.outbox.length > 1 ? "s" : ""} waiting to upload` : ""}${cloud.error ? ` · ${esc(cloud.error)}` : ""}</span></p>`
+          : `<p class="muted">Local mode: scores and added quizzes are stored in this browser only. Set up online sync (see the README) to use them on every device, or export a backup to move them by hand.</p>`}
         <div class="row-actions">
           <button class="btn cyan" data-act="export">⬇️ Export backup</button>
           <label class="btn file-label">⬆️ Import backup<input type="file" id="import" accept=".json,application/json"></label>
@@ -1171,8 +1659,11 @@
         <h2>Lock</h2>
         <p class="muted">Lock the site so the passcode is needed again.</p>
         <div class="row-actions"><button class="btn pink" data-act="lock">🔒 Lock now</button></div>
+        ${cloud.on ? `<div class="opt-group" style="margin-top:8px"><label class="label" for="new-pass">Change passcode (4+ characters)</label>
+          <div class="toolbar"><input class="field" id="new-pass" type="password" autocomplete="new-password" placeholder="New passcode"><button class="btn" data-act="changepass">Change</button></div></div>`
+          : '<p class="muted" style="font-size:.9rem">To change the passcode in local mode, edit <code>PASSCODE</code> at the top of app.js.</p>'}
       </section>`);
-    const bind = (id, key, after) => { $(id).onchange = (e) => { db.settings[key] = e.target.checked; save(); after && after(); }; };
+    const bind = (id, key, after) => { $(id).onchange = (e) => { db.settings[key] = e.target.checked; data.saveState(); after && after(); }; };
     bind("#set-sound", "sound", () => db.settings.sound && sfx.right());
     bind("#set-confetti", "confetti", () => db.settings.confetti && confetti(60));
     bind("#set-calm", "calm", applyCalm);
@@ -1181,12 +1672,13 @@
       const r = new FileReader();
       r.onload = () => {
         try {
-          const data = JSON.parse(String(r.result));
-          if (!Array.isArray(data.attempts) || !Array.isArray(data.custom)) throw new Error();
+          const backup = JSON.parse(String(r.result));
+          if (!Array.isArray(backup.attempts) || !Array.isArray(backup.custom)) throw new Error();
           const ids = new Set(db.attempts.map((a) => a.id));
-          db.attempts = [...db.attempts, ...data.attempts.filter((a) => !ids.has(a.id))].sort((a, b) => new Date(b.date) - new Date(a.date));
-          const cids = new Set(db.custom.map((c) => c.title));
-          db.custom = [...db.custom, ...data.custom.filter((c) => !cids.has(c.title))];
+          backup.attempts.filter((a) => !ids.has(a.id)).forEach((a) => { db.attempts.push(a); queue({ t: "attempt", data: a }); });
+          db.attempts.sort((a, b) => new Date(b.date) - new Date(a.date));
+          const cids = new Set(db.custom.map(quizIdOf));
+          backup.custom.filter((c) => !cids.has(quizIdOf(c))).forEach((c) => data.saveQuiz(c));
           save(); toast("Backup imported ✅"); renderSettings();
         } catch { toast("That file isn't a Quizmaxxing backup."); }
       };
@@ -1205,6 +1697,14 @@
     const out = $("#export-out");
     out.value = json; out.hidden = false;
     navigator.clipboard?.writeText(json).then(() => toast("Backup downloaded and copied to clipboard"), () => { out.select(); toast("Backup is in the box below. Copy it somewhere safe."); });
+  }
+  async function changePasscode() {
+    const v = $("#new-pass").value.trim().toLowerCase();
+    if (v.length < 4) return toast("Make the passcode at least 4 characters.");
+    const { error } = await cloud.sb.auth.updateUser({ password: PW_PREFIX + v });
+    if (error) return toast(`Couldn't change it: ${error.message}`);
+    $("#new-pass").value = "";
+    toast("Passcode changed. Use the new one next time 🔐", 3500);
   }
   function applyCalm() { document.body.classList.toggle("calm", !!db.settings.calm); }
 
@@ -1251,7 +1751,7 @@
     more: () => { histLimit += 25; renderDashboard(); },
     delattempt: (d) => confirmBox({
       title: "Delete this attempt?", body: "It'll be removed from your history and stats.", yes: "Delete", danger: true,
-      onYes: () => { db.attempts = db.attempts.filter((a) => a.id !== d.aid); save(); renderDashboard(); }
+      onYes: () => { data.deleteAttempt(d.aid); renderDashboard(); }
     }),
     validate: () => validateDraft(),
     savequiz: () => saveDraft(),
@@ -1261,16 +1761,33 @@
       const c = db.custom[Number(d.i)];
       confirmBox({
         title: `Delete "${c.title}"?`, body: "The quiz is removed from this browser. Past scores stay in your history.", yes: "Delete", danger: true,
-        onYes: () => { db.custom.splice(Number(d.i), 1); save(); renderAdd(); }
+        onYes: () => { data.deleteQuiz(quizIdOf(c)); renderAdd(); }
       });
     },
     export: () => exportData(),
     reset: () => confirmBox({
-      title: "Reset all progress?", body: "Every score, streak and badge is wiped from this browser. Added quizzes stay. Export a backup first if you might want it back.",
+      title: "Reset all progress?", body: `Every score, streak and badge is wiped${cloud.on ? " on all your devices" : " from this browser"}. Added quizzes stay. Export a backup first if you might want it back.`,
       yes: "Wipe it", danger: true,
-      onYes: () => { db.attempts = []; db.prefs = {}; save(); toast("Progress reset. Fresh start ✨"); renderSettings(); }
+      onYes: () => { data.wipeAttempts(); toast("Progress reset. Fresh start ✨"); renderSettings(); }
     }),
-    lock: () => lockNow()
+    lock: () => lockNow(),
+    aisavekey: () => {
+      const v = $("#ai-key").value.trim();
+      if (!/^sk-ant-/.test(v)) return toast("That doesn't look like a Claude API key. It starts with sk-ant-.");
+      db.aiKey = v; data.saveState(); toast("Key saved 🔑"); renderAI();
+    },
+    aidelkey: () => confirmBox({ title: "Remove your API key?", body: "The AI maker stops working until you add a key again.", yes: "Remove", danger: true,
+      onYes: () => { db.aiKey = ""; data.saveState(); renderAI(); } }),
+    aigo: () => aiGenerate(),
+    aicopy: () => copyPrompt(),
+    aidelfile: (d) => { ai.files.splice(Number(d.i), 1); renderAI(); },
+    aidelq: (d) => { ai.result.questions.splice(Number(d.i), 1); if (!ai.result.questions.length) ai.result = null; renderAI(); },
+    aipublish: () => aiPublish(false),
+    aiplay: () => aiPublish(true),
+    aiedit: () => { draft = JSON.stringify(ai.result, null, 2); location.hash = "#add"; },
+    aidiscard: () => confirmBox({ title: "Discard this quiz?", body: "You can generate it again from your material.", yes: "Discard", danger: true,
+      onYes: () => { ai.result = null; renderAI(); } }),
+    changepass: () => changePasscode()
   };
   app.addEventListener("click", (e) => {
     const link = e.target.closest('a[href^="#"]');
@@ -1315,8 +1832,19 @@
   });
 
   /* ---------------- boot ---------------- */
-  load();
-  loadBuiltIn();
-  applyCalm();
-  route();
+  async function boot() {
+    load();
+    loadBuiltIn();
+    applyCalm();
+    if (cloud.on) {
+      const { data: got } = await cloud.sb.auth.getSession().catch(() => ({ data: {} }));
+      cloud.user = got && got.session ? got.session.user : null;
+    }
+    route();
+    if (isUnlocked() && cloud.on) {
+      await pull();
+      if (!session && !isModalOpen()) route();
+    }
+  }
+  boot();
 })();

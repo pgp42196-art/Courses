@@ -360,3 +360,13 @@ ul.nemesis { margin: 0; padding: 0; }
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
 body.calm *, body.calm *::before, body.calm *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; }
+
+/* ---------- sync + AI maker ---------- */
+.sync-pill { font-family: var(--f-mono); font-size: .75rem; padding: .25em .6em; border-radius: 999px; border: 1.5px solid var(--line); color: var(--muted); white-space: nowrap; }
+.sync-pill[data-state="ok"] { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+.sync-pill[data-state="offline"] { color: var(--warn); border-color: var(--warn); }
+.ai-text { min-height: 300px; font-family: var(--f-body); font-size: .95rem; }
+.ai-opts { display: grid; gap: 4px; font-size: .92rem; }
+.ai-opt { padding: 6px 10px; border-radius: 10px; background: var(--ink-2); color: var(--muted); overflow-wrap: anywhere; }
+.ai-opt.right { color: var(--fg); background: color-mix(in srgb, var(--good) 16%, var(--ink-2)); font-weight: 700; }
+.ai-key { border-color: var(--lime); }
